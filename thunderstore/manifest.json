@@ -1,0 +1,7 @@
+{
+  "name": "ReSkate_DarkPop",
+  "version_number": "0.1.0",
+  "website_url": "https://github.com/Sivaes/reskate-dark-pop",
+  "description": "Dark Pop for ReSkate: hold D-pad Right as a dark-catch flip lands to pop again, like before skate. 0.32.0. No Bail can stay off. Toggle in Insert > Skater > BOOSTS. Offline use. One-click Install.bat.",
+  "dependencies": []
+}
