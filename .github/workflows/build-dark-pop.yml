@@ -1,0 +1,200 @@
+name: Build Dark Pop
+
+# Builds ReSkate (any release tag, or main) with the Dark Pop patch applied, and packages it.
+# Nothing here copies ReSkate's source: it is fetched from the ReSkate project each time, so a new ReSkate
+# version is one run with a new "upstream_ref". If the patch no longer fits, the run stops at the
+# "Apply the patch" step and says so.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: ReSkate version to build on - a release tag such as v1.0.9, or main
+        required: true
+        default: v1.0.9
+      mod_version:
+        description: Dark Pop version, x.y.z
+        required: true
+        default: 0.2.0
+      publish:
+        description: Publish a self-updating GitHub release (leave off for a zip to test or send to a friend)
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      UPSTREAM_REF: ${{ inputs.upstream_ref }}
+      MOD_VERSION: ${{ inputs.mod_version }}
+      PUBLISH: ${{ inputs.publish }}
+
+    steps:
+      - name: Keep line endings as they are
+        run: git config --global core.autocrlf false
+
+      - name: Check out this repository
+        uses: actions/checkout@v7
+        with:
+          path: mod
+          persist-credentials: false
+
+      - name: Find the ReSkate version
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $want = "$env:UPSTREAM_REF".Trim()
+          $lines = git ls-remote --tags --refs https://github.com/Dingo-Shenanigans/ReSkate.git
+          if ($LASTEXITCODE -ne 0) { throw 'Could not reach github.com/Dingo-Shenanigans/ReSkate to list its versions.' }
+          $tags = @($lines | ForEach-Object { ($_ -split 'refs/tags/')[1] } | Where-Object { $_ })
+          if ($want -eq 'main') { $found = 'main' }
+          elseif ($tags -contains $want) { $found = $want }
+          elseif ($tags -contains "v$want") { $found = "v$want" }
+          else {
+            $recent = ($tags | Select-Object -Last 15) -join ', '
+            throw "ReSkate has no version called '$want'. Use 'main' or one of its release tags. Latest tags: $recent"
+          }
+          "Building on ReSkate: $found"
+          "RESOLVED_REF=$found" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Check out ReSkate
+        uses: actions/checkout@v7
+        with:
+          repository: Dingo-Shenanigans/ReSkate
+          ref: ${{ env.RESOLVED_REF }}
+          path: src
+          persist-credentials: false
+
+      - name: Work out the versions
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:MOD_VERSION -notmatch '^\d+\.\d+\.\d+$') { throw 'mod_version must look like 1.2.3' }
+          if ($env:RESOLVED_REF -match '^v?(\d+\.\d+\.\d+)$') { $base = $Matches[1]; $label = $base } else { $base = '0.0.0'; $label = $env:RESOLVED_REF }
+          "BASE_VERSION=$base" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "BASE_LABEL=$label" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          # The build carries this name in the start-up notice, the log and crash reports.
+          "MOD_NAME=ReSkate_DarkPop" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "ReSkate $label + Dark Pop $env:MOD_VERSION" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+
+      - name: Apply the patch
+        working-directory: src
+        run: |
+          $patches = @('dark-pop.patch')
+          foreach ($name in $patches) {
+            $patch = Join-Path $env:GITHUB_WORKSPACE "mod/patches/$name"
+            if (-not (Test-Path $patch)) {
+              Write-Host 'Files in this repository:'
+              Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE 'mod') -Recurse -File -Name | Where-Object { $_ -notlike '.git*' } | Select-Object -First 40
+              throw "patches/$name is not in this repository. Upload the 'patches' folder from the zip so the file is at patches/$name."
+            }
+            git apply --ignore-whitespace --check $patch
+            if ($LASTEXITCODE -ne 0) { throw "patches/$name is there but does not fit ReSkate $env:RESOLVED_REF. ReSkate changed a file the patch edits; the patch needs updating for this version." }
+            git apply --ignore-whitespace $patch
+            if ($LASTEXITCODE -ne 0) { throw "patches/$name failed to apply." }
+            Write-Host "Applied patches/$name"
+            "Applied patches/$name" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Configure
+        # A published release updates itself from this repository's releases; a test zip never replaces itself.
+        # Crash reports stay on and go where ReSkate's go, labelled with this mod's name and version.
+        working-directory: src
+        run: |
+          # The mod repository's commit goes after the version (0.2.1+abc1234), so the game's start-up notice and log
+          # say exactly which build is running, and it can be matched to a commit in this repository.
+          $commit = (git -C (Join-Path $env:GITHUB_WORKSPACE 'mod') rev-parse --short HEAD).Trim()
+          "Mod repository commit: $commit" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          $cmakeArgs = @('--preset', 'vs2022-x64', "-DDINGOSDK_VERSION=$env:BASE_VERSION", "-DDINGOSDK_MOD_ID=$env:MOD_NAME", "-DDINGOSDK_MOD_VERSION=$env:MOD_VERSION+$commit")
+          if ($env:PUBLISH -eq 'true') { $cmakeArgs += @('-DDINGOSDK_LAUNCHER_AUTO_UPDATE=ON', "-DDINGOSDK_RELEASE_REPO=${{ github.repository }}") }
+          else { $cmakeArgs += '-DDINGOSDK_LAUNCHER_AUTO_UPDATE=OFF' }
+          cmake @cmakeArgs
+
+      - name: Build launcher and runtime
+        working-directory: src
+        run: cmake --build --preset release --parallel 4 --target dingosdk_launcher dingosdk_runtime
+
+      - name: Package
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ws = $env:GITHUB_WORKSPACE
+          $release = "$ws/out/release"; $package = "$ws/out/package"
+          New-Item -ItemType Directory -Path $release, "$package/licenses" -Force | Out-Null
+          Copy-Item "$ws/src/build/vs2022-x64/Release/ReSkate.dll", "$ws/src/build/vs2022-x64/Release/ReSkateLauncher.exe" -Destination $release
+          Copy-Item -Path "$ws/mod/thunderstore/*" -Destination $package -Recurse
+          Remove-Item "$package/UPSTREAM_VERSION" -ErrorAction SilentlyContinue
+          Copy-Item "$release/ReSkate.dll", "$release/ReSkateLauncher.exe" -Destination $package
+          Copy-Item "$ws/src/LICENSE" -Destination "$package/LICENSE.txt"
+          foreach ($dir in Get-ChildItem "$ws/src/External" -Directory) {
+            $file = Get-ChildItem $dir.FullName -File | Where-Object { $_.Name -match '^LICENSE(\.txt)?$' } | Select-Object -First 1
+            if ($file) { Copy-Item $file.FullName "$package/licenses/$($dir.Name)-LICENSE.txt" }
+          }
+          Copy-Item "$ws/src/External/fonts/*-LICENSE.txt" "$package/licenses" -ErrorAction SilentlyContinue
+          $manifestPath = "$package/manifest.json"
+          $manifest = Get-Content -Raw $manifestPath | ConvertFrom-Json
+          $manifest.version_number = $env:MOD_VERSION
+          if ($manifest.description.Length -gt 250) { throw 'manifest description is over 250 characters' }
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8NoBOM $manifestPath
+          foreach ($file in 'Install.bat', 'README.md') {
+            $path = "$package/$file"
+            (Get-Content -Raw $path).Replace('@MOD@', $env:MOD_VERSION).Replace('@BASE@', $env:BASE_LABEL) | Set-Content -NoNewline -Encoding utf8NoBOM $path
+          }
+          $zip = "$release/ReSkate_DarkPop-$env:MOD_VERSION.zip"
+          Compress-Archive -Path "$package/*" -DestinationPath $zip -Force
+          $lines = foreach ($f in "$release/ReSkate.dll", "$release/ReSkateLauncher.exe", $zip) { "$((Get-FileHash $f -Algorithm SHA256).Hash.ToLower())  $(Split-Path $f -Leaf)" }
+          $lines | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          $lines
+
+      - name: Upload the zip
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.MOD_NAME }}-${{ inputs.mod_version }}-on-${{ inputs.upstream_ref }}
+          path: out/release/ReSkate_DarkPop-${{ inputs.mod_version }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Write launcher.json (published releases only)
+        if: ${{ inputs.publish }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ws = $env:GITHUB_WORKSPACE
+          $out = "$ws/out/release"
+          function Pin($name) {
+            $path = "$out/$name"
+            [ordered]@{ version = $env:MOD_VERSION; url = "asset:$name"; sha256 = (Get-FileHash $path -Algorithm SHA256).Hash.ToLower(); size = (Get-Item $path).Length }
+          }
+          # The game build is read from the source being built, so it always matches this DLL.
+          $header = Get-Content -Raw "$ws/src/Engine/Game/Build/supported_build.h"
+          function Field($pattern) { if ($header -match $pattern) { $Matches[1] } else { throw "supported_build.h: no match for $pattern" } }
+          $game = [ordered]@{
+            app_id = [uint32](Field 'steam_app_id = (\d+)')
+            depot_id = [uint32](Field 'steam_depot_id = (\d+)')
+            manifest_id = (Field 'steam_manifest_id = "(\d+)"')
+            build_id = (Field 'steam_build_id = "(\d+)"')
+            skate_sha256 = (Field 'game_sha256 =\s*"([0-9a-f]{64})"')
+          }
+          # DepotDownloader is a third-party tool pinned by hash (the pin ReSkate itself uses).
+          $depot = [ordered]@{
+            version = '3.4.0'
+            url = 'https://github.com/SteamRE/DepotDownloader/releases/download/DepotDownloader_3.4.0/DepotDownloader-windows-x64.zip'
+            sha256 = '41c9e9f0df54b3ad02e67a11726756e5c73283bd7c2e1b04acfa5ae4c2ed3767'
+            size = 33474005
+          }
+          [ordered]@{ schema = 1; launcher = Pin 'ReSkateLauncher.exe'; runtime = Pin 'ReSkate.dll'; game = $game; depot_downloader = $depot } |
+            ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8NoBOM "$out/launcher.json"
+          Get-Content "$out/launcher.json"
+
+      - name: Publish the release (published releases only)
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release create "v$env:MOD_VERSION" --repo ${{ github.repository }} --title "ReSkate Dark Pop $env:MOD_VERSION" `
+            --notes "Dark Pop $env:MOD_VERSION, built on ReSkate $env:BASE_LABEL. Players who installed this mod update from this release when they start its launcher. The zip is the Thunderstore package." `
+            out/release/launcher.json out/release/ReSkateLauncher.exe out/release/ReSkate.dll "out/release/ReSkate_DarkPop-$env:MOD_VERSION.zip"
