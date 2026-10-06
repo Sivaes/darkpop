@@ -11,11 +11,11 @@ on:
       upstream_ref:
         description: ReSkate version to build on - a release tag such as v1.0.9, or main
         required: true
-        default: v1.0.9
+        default: v1.1.1
       mod_version:
         description: Dark Pop version, x.y.z
         required: true
-        default: 0.2.0
+        default: 0.3.0
       publish:
         description: Publish a self-updating GitHub release (leave off for a zip to test or send to a friend)
         type: boolean
