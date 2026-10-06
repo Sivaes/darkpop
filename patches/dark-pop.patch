@@ -1,4 +1,5 @@
-diff -ruN a/Extension/Skater/client_debug.cpp b/Extension/Skater/client_debug.cpp
+diff --git a/Extension/Skater/client_debug.cpp b/Extension/Skater/client_debug.cpp
+index db209dc..c063ff8 100644
 --- a/Extension/Skater/client_debug.cpp
 +++ b/Extension/Skater/client_debug.cpp
 @@ -7,10 +7,17 @@
@@ -19,43 +20,40 @@ diff -ruN a/Extension/Skater/client_debug.cpp b/Extension/Skater/client_debug.cp
  #include <optional>
  #include <utility>
  
-@@ -60,6 +67,134 @@
+@@ -60,6 +67,131 @@ std::array<float, 3> debug_position(SourceReader& reader, std::uintptr_t address
      return {row[0], row[1], row[2]};
  }
  }
-+// ---- Dark Pop ---------------------------------------------------------------------
-+// The selector hook in no_bail.cpp turns the end of a flight into a new pop while D-pad Right is held, and
-+// holds off the game's bail handling around it. This tick only reads the pad, publishes it, and reports (and
-+// optionally boosts) each pop and the landing after it. Nothing is read until Dark Pop is switched on.
++// ---- Dark Pop (auto release) -----------------------------------------------------------
++// The selector hook in no_bail.cpp times each flight and input_capture.cpp shows the game a perfectly timed release
++// of D-pad Right. This tick publishes the switch and the timing, and reports (and optionally boosts) each flight.
++// Nothing is read until Dark Pop is switched on.
++extern "C" void DingoSDKOverlayDarkPopEnable(bool enabled) noexcept;
++extern "C" std::uint64_t DingoSDKOverlayDarkPopGamePolls() noexcept;
 +namespace {
-+constexpr std::uint32_t dpad_right = 0x8;
 +void dark_pop_tick(InteractiveDebug& debug, std::uintptr_t client, std::uintptr_t entity,
 +    const NoclipBodies& bodies, bool ready) {
-+    if (!debug.dark_pop) { dark_pop_update(false, false); return; }
-+    const bool allowed = ready && session_boosts_allowed() && session_no_bail_allowed() &&
-+        !debug.noclip && !debug.park_editor;
-+    ControllerInput pad;
-+    DingoSDKOverlayReadControllerInput(&pad);
-+    const bool held = pad.available && (pad.buttons & dpad_right) != 0;
-+    dark_pop_update(allowed, held);
++    const bool allowed = debug.dark_pop && ready && session_boosts_allowed() && !debug.noclip && !debug.park_editor;
++    dark_pop_update(allowed, debug.dark_pop_release);
++    DingoSDKOverlayDarkPopEnable(allowed);
++    if (!debug.dark_pop) return;
 +    const auto last = dark_pop_last();
-+    if (last.count != debug.dark_pop_seen) {
-+        debug.dark_pop_seen = last.count;
-+        ++debug.dark_pop_count;
-+        const float strength = std::min(debug.dark_pop_strength, 25.0f);
-+        const bool boost = strength >= 0.5f && source_state().velocity_guard_active.load(std::memory_order_acquire) &&
-+            !bodies.offboard && !debug.up_velocity.valid;
-+        if (boost)
-+            debug.up_velocity = {client, entity, bodies.core, GetTickCount64() + 1000, {0.0f, strength, 0.0f}, true};
-+        logging::log(logging::Level::info, logging::Channel::skater,
-+            "Dark Pop: flight ended (state {} -> {}); pop forced{}", last.from, last.to,
-+            boost ? std::format(", +{:.1f} m/s up", strength) : std::string());
-+    }
-+    if (last.landings != debug.dark_pop_landings_seen) {
-+        debug.dark_pop_landings_seen = last.landings;
-+        logging::log(logging::Level::info, logging::Channel::skater, "Dark Pop: landed after the pop (state {}){}",
-+            last.landed, last.landed >= 100 && last.landed < 200 ? "" : ", not riding away");
-+    }
++    if (last.flights == debug.dark_pop_seen) return;
++    debug.dark_pop_seen = last.flights;
++    if (!last.pressed) return; // a flight without D-pad Right: nothing to report
++    const bool popped = last.landed == 200;
++    const float strength = std::min(debug.dark_pop_strength, 25.0f);
++    const bool boost = popped && strength >= 0.5f && source_state().velocity_guard_active.load(std::memory_order_acquire) &&
++        !bodies.offboard && !debug.up_velocity.valid;
++    if (boost) debug.up_velocity = {client, entity, bodies.core, GetTickCount64() + 1000, {0.0f, strength, 0.0f}, true};
++    if (popped) ++debug.dark_pop_count;
++    const char* outcome = popped ? "popped" : last.landed >= 100 && last.landed < 200 ? "rode away (no pop)" : "bailed";
++    const auto polls = DingoSDKOverlayDarkPopGamePolls();
++    logging::log(logging::Level::info, logging::Channel::skater,
++        "Dark Pop: {:.2f} s flight (timed for {:.2f}), release shown {} -> state {}, {}{}{}", last.seconds, last.expected,
++        last.release_before >= 0.0f ? std::format("{:.3f} s before landing", last.release_before) : std::string("only at landing"),
++        last.landed, outcome, boost ? std::format(", +{:.1f} m/s up", strength) : std::string(),
++        polls ? std::string() : std::string(" (the game has not read the controller through XInput, so it saw no change)"));
 +}
 +}
 +// ---- Dark pop probe -----------------------------------------------------------
@@ -154,17 +152,18 @@ diff -ruN a/Extension/Skater/client_debug.cpp b/Extension/Skater/client_debug.cp
  std::array<float, 16> debug_skater(std::uintptr_t base, std::uintptr_t client, overlay::DebugModel& model) {
      SourceReader reader;
      source_require(reader.pointer(client) == base + addr::engine::client_vtable, "Client changed.");
-@@ -375,7 +510,8 @@
+@@ -375,7 +507,9 @@ void debug_action(SourceTrial& trial, std::uintptr_t client, bool can_control, b
          request.action == overlay::DebugAction::set_first_person_fov ||
          request.action == overlay::DebugAction::set_free_camera_fov ||
          (request.action >= overlay::DebugAction::set_first_person_spring && request.action <= overlay::DebugAction::reset_first_person_arm) ||
 -        request.action == overlay::DebugAction::set_no_bail,
 +        request.action == overlay::DebugAction::set_no_bail || request.action == overlay::DebugAction::set_dark_pop_strength ||
++        request.action == overlay::DebugAction::set_dark_pop_release ||
 +        (request.action == overlay::DebugAction::set_dark_pop_enabled && !request.enabled),
          "Close Park Editor before changing camera or HUD modes.");
      if (request.action >= overlay::DebugAction::set_first_person_spring &&
          request.action <= overlay::DebugAction::reset_first_person_arm) {
-@@ -433,6 +569,25 @@
+@@ -433,6 +567,33 @@ void debug_action(SourceTrial& trial, std::uintptr_t client, bool can_control, b
          debug.status = up ? "Up Boost speed updated." : "Forward Boost speed updated.";
          return;
      }
@@ -175,9 +174,17 @@ diff -ruN a/Extension/Skater/client_debug.cpp b/Extension/Skater/client_debug.cp
 +        debug.status = "Dark Pop extra pop updated.";
 +        return;
 +    }
++    if (request.action == overlay::DebugAction::set_dark_pop_release) {
++        source_require(std::isfinite(request.value) && request.value >= 0.05f && request.value <= 0.30f,
++            "Dark Pop release must be between 0.05 and 0.30 seconds before landing.");
++        debug.dark_pop_release = request.value;
++        debug.status = "Dark Pop release timing updated.";
++        return;
++    }
 +    if (request.action == overlay::DebugAction::set_dark_pop_enabled && !request.enabled) {
 +        debug.dark_pop = false;
-+        dark_pop_update(false, false);
++        dark_pop_update(false, debug.dark_pop_release);
++        DingoSDKOverlayDarkPopEnable(false);
 +        debug.status = "Dark Pop disabled.";
 +        logging::write(logging::Level::info, logging::Channel::skater, "Dark Pop disabled");
 +        return;
@@ -190,38 +197,34 @@ diff -ruN a/Extension/Skater/client_debug.cpp b/Extension/Skater/client_debug.cp
      if (request.action == overlay::DebugAction::restore_debug) {
          if (debug.save_pending) save_debug(debug);
          debug.first_person_settings = {};
-@@ -445,6 +600,8 @@
+@@ -445,6 +606,9 @@ void debug_action(SourceTrial& trial, std::uintptr_t client, bool can_control, b
          debug.up_velocity_speed = 20.0f;
          debug.up_velocity.valid = false;
          debug.no_bail = false;
 +        debug.dark_pop = false;
-+        dark_pop_update(false, false);
++        dark_pop_update(false, debug.dark_pop_release);
++        DingoSDKOverlayDarkPopEnable(false);
          debug_stop_noclip(debug);
          clear_no_bail();
          // Level loads drop temporary modes, never the player's saved choices.
-@@ -498,6 +655,21 @@
+@@ -498,6 +662,16 @@ void debug_action(SourceTrial& trial, std::uintptr_t client, bool can_control, b
          debug.status = up ? "Up Boost queued." : "Forward Boost queued.";
          return;
      }
 +    if (request.action == overlay::DebugAction::set_dark_pop_enabled) {
 +        source_require(session_boosts_allowed(), "The host has turned off boosts in this session.");
-+        source_require(session_no_bail_allowed(), "Dark Pop uses No Bail around the pop, which the host has turned off in this session.");
-+        overlay::DebugModel skater;
-+        (void)debug_skater(trial.base, client, skater);
-+        // Only checks that the local skater can be found the way the hooks find it; No Bail is left as it is.
-+        source_require(update_no_bail(client, skater.skater_identity, debug.no_bail && session_no_bail_allowed(),
-+            debug.noclip && debug.noclip_velocity.valid, debug.noclip_velocity.expires), "Dark Pop is unavailable for the current skater.");
 +        debug.dark_pop = true;
 +        mark_debug_changed(debug);
-+        debug.status = "Dark Pop enabled. Hold D-pad Right as your flip trick lands; No Bail can stay off.";
-+        logging::log(logging::Level::info, logging::Channel::skater, "Dark Pop enabled{}",
++        debug.status = "Dark Pop enabled. Press D-pad Right in the air on a dark catch; the mod times the release.";
++        logging::log(logging::Level::info, logging::Channel::skater, "Dark Pop (auto release) enabled, release {:.2f} s before landing{}",
++            debug.dark_pop_release,
 +            dingosdk::reskate_modified_build ? std::format(" (modified build {} {})", dingosdk::reskate_mod_id, dingosdk::reskate_mod_version) : std::string());
 +        return;
 +    }
      if (request.action == overlay::DebugAction::set_no_bail) {
          source_require(session_no_bail_allowed(), "The host has turned off No Bail in this session.");
          overlay::DebugModel skater;
-@@ -768,7 +940,7 @@
+@@ -768,7 +942,7 @@ overlay::DebugModel on_client_debug_tick(std::uintptr_t base, std::uintptr_t cli
          !state.velocity_guard_active.load(std::memory_order_acquire) ? "Up Boost is unavailable for this game build." :
          "Local skater physics could not be read.";
      try {
@@ -230,45 +233,48 @@ diff -ruN a/Extension/Skater/client_debug.cpp b/Extension/Skater/client_debug.cp
          const auto bodies = debug_noclip_bodies(base, client, model.skater_identity);
          if (debug.forward_velocity.valid && (GetTickCount64() >= debug.forward_velocity.expires ||
              debug.forward_velocity.entity != model.skater_identity || debug.forward_velocity.core != bodies.core)) {
-@@ -798,6 +970,10 @@
+@@ -798,6 +972,10 @@ overlay::DebugModel on_client_debug_tick(std::uintptr_t base, std::uintptr_t cli
          } else if (debug.up_velocity.valid) {
              model.up_velocity_unavailable = "Up Boost is being applied.";
          }
--        model.no_bail_available = can_control && update_no_bail(client, model.skater_identity, debug.no_bail && no_bail_allowed,
 +        try { dark_pop_tick(debug, client, model.skater_identity, bodies, can_control); }
 +        catch (...) {}
 +        try { probe_tick(debug, skater_transform, bodies, can_control); }
 +        catch (...) {}
-+        model.no_bail_available = can_control && update_no_bail(client, model.skater_identity, (debug.no_bail || dark_pop_protecting()) && no_bail_allowed,
+         model.no_bail_available = can_control && update_no_bail(client, model.skater_identity, debug.no_bail && no_bail_allowed,
              debug.noclip && debug.noclip_velocity.valid, debug.noclip_velocity.expires);
          if (model.camera_available) {
-@@ -848,6 +1024,10 @@
+@@ -848,6 +1026,11 @@ overlay::DebugModel on_client_debug_tick(std::uintptr_t base, std::uintptr_t cli
      model.forward_velocity_updates = debug.forward_velocity_updates;
      model.up_velocity_speed = debug.up_velocity_speed;
      model.up_velocity_updates = debug.up_velocity_updates;
 +    model.dark_pop = debug.dark_pop;
 +    model.dark_pop_strength = debug.dark_pop_strength;
++    model.dark_pop_release = debug.dark_pop_release;
 +    model.dark_pop_count = debug.dark_pop_count;
 +    model.probe = debug.probe;
      return model;
  }
  bool restore_client_debug(std::uintptr_t base, std::uintptr_t client, bool camera_phase_observed) {
-diff -ruN a/Extension/Skater/client_source_spawn_internal.h b/Extension/Skater/client_source_spawn_internal.h
+diff --git a/Extension/Skater/client_source_spawn_internal.h b/Extension/Skater/client_source_spawn_internal.h
+index a1efea7..ba5acf6 100644
 --- a/Extension/Skater/client_source_spawn_internal.h
 +++ b/Extension/Skater/client_source_spawn_internal.h
-@@ -131,6 +131,11 @@
+@@ -131,6 +131,12 @@ struct InteractiveDebug {
      float forward_velocity_speed = 20.0f;
      std::uint64_t up_velocity_updates{};
      float up_velocity_speed = 20.0f;
 +    // Dark Pop (see dark_pop_tick and probe_tick in client_debug.cpp).
 +    bool dark_pop{};
 +    float dark_pop_strength{}; // extra upward speed, m/s, queued as an Up Boost after the pop
-+    std::uint64_t dark_pop_count{}, dark_pop_seen{}, dark_pop_landings_seen{};
++    float dark_pop_release{0.16f}; // seconds before the expected landing the game is shown D-pad Right let go
++    std::uint64_t dark_pop_count{}, dark_pop_seen{};
 +    bool probe{}; // see probe_tick in client_debug.cpp
      float noclip_altitude{};
      bool noclip_altitude_valid{}, noclip_altitude_offboard{};
      // Player choices kept in the local profile (see load_saved_debug):
-diff -ruN a/Extension/Skater/no_bail.cpp b/Extension/Skater/no_bail.cpp
+diff --git a/Extension/Skater/no_bail.cpp b/Extension/Skater/no_bail.cpp
+index 2efddc5..ad31e53 100644
 --- a/Extension/Skater/no_bail.cpp
 +++ b/Extension/Skater/no_bail.cpp
 @@ -1,4 +1,5 @@
@@ -277,7 +283,18 @@ diff -ruN a/Extension/Skater/no_bail.cpp b/Extension/Skater/no_bail.cpp
  #include "Engine/Core/Hooks/hooks.h"
  #include "Engine/Core/Log/logging.h"
  #include "Engine/Core/Platform/memory.h"
-@@ -119,6 +120,20 @@
+@@ -6,8 +7,10 @@
+ #include "Engine/Game/Build/addresses.h"
+ #include "Engine/Game/Build/20260929/engine.h"
+ #include "Engine/Game/Build/20260929/no_bail.h"
++#include <algorithm>
+ #include <atomic>
+ #include <intrin.h>
++#include <utility>
+ 
+ namespace dingosdk {
+ namespace {
+@@ -119,6 +122,20 @@ bool protected_owner(std::uintptr_t object, std::uintptr_t Owner::* member, Owne
      if (owner) *owner = current;
      return true;
  }
@@ -298,54 +315,88 @@ diff -ruN a/Extension/Skater/no_bail.cpp b/Extension/Skater/no_bail.cpp
  bool cancel_request(std::uintptr_t context, std::uintptr_t offset, LONG mask) noexcept {
      const auto address = context + offset;
      if (context < 0x10000 || context > highest - offset - sizeof(LONG) ||
-@@ -185,6 +200,78 @@
+@@ -185,6 +202,112 @@ void hold_off_board(std::uintptr_t selector, std::uint32_t current) noexcept {
      if (!resolve(board.owner.client, board.owner.entity, current_owner) || current_owner != board.owner) return;
      (void)cancel_request(current_owner.context, animation_request_offset, mount_request_mask);
  }
-+// ---- Dark Pop ----------------------------------------------------------------------
-+// The first Dark Pop, unchanged in what it does: D-pad Right held as a flight ends turns the landing into a new
-+// pop. It used to need No Bail switched on, both to find the local skater and to stop the game bailing around
-+// the pop. Now it finds the skater from the lease's owner (published with No Bail off too), and asks for No
-+// Bail's protection itself, only while it matters (dark_pop_protecting, added to the lease by the client tick).
-+constexpr std::uint32_t dark_pop_state = 200;
-+constexpr std::uint64_t dark_pop_cooldown_ms = 1000; // one forced pop per second at most
-+constexpr std::uint64_t dark_pop_flight_ms = 3000;   // protection after a pop if no landing is seen first
-+constexpr std::uint64_t dark_pop_settle_ms = 300;    // protection after the landing that follows a pop
++// ---- Dark Pop (auto release) ---------------------------------------------------------
++// Two recordings (31 attempts of a 360 inward heelflip, dark catch) showed the pop depends mostly on when D-pad Right is
++// let go: under 0.11 s before the landing it never popped, 0.14 s or more it almost always did. So the mod does the
++// timing: it measures each flight from the ground, expects the next to last as long as the recent ones (they are
++// within a few hundredths of a second on flat ground), and has the game shown the release `lead` seconds before.
++extern "C" void DingoSDKOverlayDarkPopFlightStart(std::int64_t release_at) noexcept;
++extern "C" bool DingoSDKOverlayDarkPopFlightEnd(std::int64_t* shown_release) noexcept;
 +bool dark_pop_air(std::uint32_t state) noexcept { return state >= 200 && state < 300; }
++bool dark_pop_ground(std::uint32_t state) noexcept { return state >= 100 && state < 200; }
 +struct DarkPop {
-+    std::atomic<bool> enabled{}, airborne{}, popped{};
-+    std::atomic<std::uint64_t> held_until{}, cooldown_until{}, protect_until{}, count{}, landings{};
-+    std::atomic<std::uint32_t> from{}, to{}, landed{};
++    std::atomic<bool> enabled{};
++    std::atomic<float> lead{0.16f};
++    std::atomic<std::int64_t> takeoff{}, expected{}; // QPC of the current timed flight (0 = none), and its expected length
++    std::atomic<std::int64_t> recent[3]{};           // the last flight lengths from the ground, QPC ticks (0 = none yet)
++    std::atomic<unsigned> next_recent{};
++    std::atomic<std::uint64_t> flights{};
++    std::atomic<bool> pressed{};
++    std::atomic<std::uint32_t> landed{};
++    std::atomic<float> seconds{}, release_before{}, expected_seconds{};
 +};
 +DarkPop& dark_pop() { static auto* value = new DarkPop; return *value; }
-+// `wanted` is what the game chose and `kept` what No Bail's swap left of it (it only swaps while protected).
-+// A held press meeting the end of a flight becomes the pop state; otherwise `kept` stands.
-+std::uint32_t dark_pop_override(std::uintptr_t selector, std::uint32_t current, std::uint32_t wanted, std::uint32_t kept) noexcept {
++std::int64_t dark_pop_frequency() noexcept {
++    static const std::int64_t value = [] { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f.QuadPart > 0 ? std::int64_t{f.QuadPart} : std::int64_t{1}; }();
++    return value;
++}
++float dark_pop_seconds(std::int64_t ticks) noexcept {
++    return static_cast<float>(static_cast<double>(ticks) / static_cast<double>(dark_pop_frequency()));
++}
++// The flight to time for: the middle of the last three, or 0.84 s (a flat-ground flip trick) until there are three.
++std::int64_t dark_pop_expected_flight(DarkPop& d) noexcept {
++    std::int64_t v[3]{};
++    for (int i = 0; i < 3; ++i) v[i] = d.recent[i].load(std::memory_order_relaxed);
++    if (!v[0] || !v[1] || !v[2]) return dark_pop_frequency() * 84 / 100;
++    if (v[0] > v[1]) std::swap(v[0], v[1]);
++    if (v[1] > v[2]) std::swap(v[1], v[2]);
++    if (v[0] > v[1]) std::swap(v[0], v[1]);
++    return v[1];
++}
++// After the original selector has chosen. Only reads states and the clock; never changes the choice.
++void dark_pop_track(std::uintptr_t selector, std::uint32_t current, std::uint32_t chosen) noexcept {
 +    auto& d = dark_pop();
-+    if (!d.enabled.load(std::memory_order_relaxed) || !local_owner(selector, &Owner::selector)) return kept;
-+    const auto now = GetTickCount64();
-+    if (dark_pop_air(current) && !dark_pop_air(wanted) && now < d.held_until.load(std::memory_order_relaxed) &&
-+        now >= d.cooldown_until.load(std::memory_order_relaxed)) {
-+        d.cooldown_until.store(now + dark_pop_cooldown_ms, std::memory_order_relaxed);
-+        d.protect_until.store(now + dark_pop_flight_ms, std::memory_order_relaxed);
-+        d.popped.store(true, std::memory_order_relaxed);
-+        d.airborne.store(true, std::memory_order_relaxed);
-+        d.from.store(current, std::memory_order_relaxed);
-+        d.to.store(wanted, std::memory_order_relaxed);
-+        d.count.fetch_add(1, std::memory_order_acq_rel);
-+        return dark_pop_state;
++    if (!d.enabled.load(std::memory_order_relaxed)) {
++        if (d.takeoff.exchange(0, std::memory_order_relaxed)) (void)DingoSDKOverlayDarkPopFlightEnd(nullptr);
++        return;
 +    }
-+    if (d.popped.load(std::memory_order_relaxed) && dark_pop_air(current) && !dark_pop_air(kept)) {
-+        // The flight the pop started has ended: keep protecting for a moment while the landing settles.
-+        d.popped.store(false, std::memory_order_relaxed);
-+        d.protect_until.store(now + dark_pop_settle_ms, std::memory_order_relaxed);
-+        d.landed.store(kept, std::memory_order_relaxed);
-+        d.landings.fetch_add(1, std::memory_order_acq_rel);
++    const bool lands = dark_pop_air(current) && (!dark_pop_air(chosen) || (chosen == 200 && current != 200));
++    const bool takes_off = dark_pop_ground(current) && dark_pop_air(chosen);
++    if (!lands && !takes_off) return;
++    if (!local_owner(selector, &Owner::selector)) return;
++    LARGE_INTEGER clock{};
++    QueryPerformanceCounter(&clock);
++    const std::int64_t now = clock.QuadPart;
++    const std::int64_t frequency = dark_pop_frequency();
++    if (lands) {
++        if (const auto takeoff = d.takeoff.exchange(0, std::memory_order_relaxed)) {
++            std::int64_t shown_release{};
++            const bool pressed = DingoSDKOverlayDarkPopFlightEnd(&shown_release);
++            const auto length = now - takeoff;
++            // Learn from flights of a sensible length (0.4 to 2 s), whatever happened at the landing.
++            if (length > frequency * 4 / 10 && length < frequency * 2)
++                d.recent[d.next_recent.fetch_add(1, std::memory_order_relaxed) % 3].store(length, std::memory_order_relaxed);
++            d.pressed.store(pressed, std::memory_order_relaxed);
++            d.landed.store(chosen, std::memory_order_relaxed);
++            d.seconds.store(dark_pop_seconds(length), std::memory_order_relaxed);
++            d.release_before.store(shown_release ? dark_pop_seconds(now - shown_release) : -1.0f, std::memory_order_relaxed);
++            d.expected_seconds.store(dark_pop_seconds(d.expected.load(std::memory_order_relaxed)), std::memory_order_relaxed);
++            d.flights.fetch_add(1, std::memory_order_acq_rel);
++        }
++        return;
 +    }
-+    d.airborne.store(dark_pop_air(kept), std::memory_order_relaxed);
-+    return kept;
++    const auto expected = dark_pop_expected_flight(d);
++    const auto lead = static_cast<std::int64_t>(static_cast<double>(d.lead.load(std::memory_order_relaxed)) * static_cast<double>(frequency));
++    d.expected.store(expected, std::memory_order_relaxed);
++    d.takeoff.store(now, std::memory_order_relaxed);
++    DingoSDKOverlayDarkPopFlightStart(now + std::max<std::int64_t>(expected - lead, frequency / 10));
 +}
 +extern "C" void DingoSDKOverlayReadControllerInput(dingosdk::ControllerInput* input, bool allow_menu);
++extern "C" unsigned DingoSDKOverlayDarkPopInputFlags() noexcept;
 +constexpr std::size_t fast_probe_capacity = 8192; // rows; about a minute of choices per drain interval at most
 +struct FastProbe {
 +    std::atomic<bool> enabled{};
@@ -369,7 +420,7 @@ diff -ruN a/Extension/Skater/no_bail.cpp b/Extension/Skater/no_bail.cpp
 +    row.chosen = chosen;
 +    dingosdk::ControllerInput pad;
 +    DingoSDKOverlayReadControllerInput(&pad, false);
-+    row.buttons = pad.available ? pad.buttons : 0u;
++    row.buttons = (pad.available ? pad.buttons : 0u) | (DingoSDKOverlayDarkPopInputFlags() << 20); // 0x100000 shown held, 0x200000 hidden
 +    for (int i = 0; i < 8; ++i) { unsigned word{}; row.words[i] = read(owner.context + 0x13c4 + 4 * i, word) ? word : 0u; }
 +    for (int i = 0; i < 10; ++i) { unsigned word{}; row.words[8 + i] = read(owner.context + 0x140c + 4 * i, word) ? word : 0u; }
 +    f.head.store(head + 1, std::memory_order_release);
@@ -377,42 +428,34 @@ diff -ruN a/Extension/Skater/no_bail.cpp b/Extension/Skater/no_bail.cpp
  std::uint32_t choose_state(std::uintptr_t selector, std::uint32_t current) {
      {
          LastError error;
-@@ -196,7 +283,9 @@
-     const bool filtered = filter_requests(selector, &Owner::selector);
+@@ -197,6 +320,8 @@ std::uint32_t choose_state(std::uintptr_t selector, std::uint32_t current) {
      const auto next = protection().choose_original(selector, current);
      LastError error;
--    const auto chosen = filtered && next == wipeout_physics_state && protected_owner(selector, &Owner::selector) ? current : next;
-+    const auto kept = filtered && next == wipeout_physics_state && protected_owner(selector, &Owner::selector) ? current : next;
-+    const auto chosen = dark_pop_override(selector, current, next, kept);
+     const auto chosen = filtered && next == wipeout_physics_state && protected_owner(selector, &Owner::selector) ? current : next;
++    dark_pop_track(selector, current, chosen);
 +    fast_probe_record(selector, current, next, chosen);
      auto& w = state_watch();
      if (selector == w.selector.load(std::memory_order_acquire) && GetTickCount64() < w.until.load(std::memory_order_acquire)) {
          if (const auto before = w.state.exchange(chosen, std::memory_order_acq_rel); before != chosen) {
-@@ -391,6 +480,42 @@
+@@ -391,6 +516,36 @@ void clear_no_bail() noexcept {
      p.lease = {};
      ReleaseSRWLockExclusive(&p.lock);
  }
-+void dark_pop_update(bool enabled, bool held) noexcept {
++void dark_pop_update(bool enabled, float lead) noexcept {
 +    auto& d = dark_pop();
++    d.lead.store(lead, std::memory_order_relaxed);
 +    d.enabled.store(enabled, std::memory_order_relaxed);
-+    if (!enabled) {
-+        d.popped.store(false, std::memory_order_relaxed);
-+        d.protect_until.store(0, std::memory_order_relaxed);
-+        return;
-+    }
-+    if (held) d.held_until.store(GetTickCount64() + 150, std::memory_order_relaxed); // the client tick runs about 9 times a second
-+}
-+bool dark_pop_protecting() noexcept {
-+    auto& d = dark_pop();
-+    if (!d.enabled.load(std::memory_order_relaxed)) return false;
-+    const auto now = GetTickCount64();
-+    return now < d.protect_until.load(std::memory_order_relaxed) ||
-+        (now < d.held_until.load(std::memory_order_relaxed) && d.airborne.load(std::memory_order_relaxed));
 +}
 +DarkPopLast dark_pop_last() noexcept {
 +    auto& d = dark_pop();
-+    return {d.count.load(std::memory_order_acquire), d.from.load(std::memory_order_relaxed), d.to.load(std::memory_order_relaxed),
-+        d.landings.load(std::memory_order_acquire), d.landed.load(std::memory_order_relaxed)};
++    DarkPopLast last;
++    last.flights = d.flights.load(std::memory_order_acquire);
++    last.pressed = d.pressed.load(std::memory_order_relaxed);
++    last.landed = d.landed.load(std::memory_order_relaxed);
++    last.seconds = d.seconds.load(std::memory_order_relaxed);
++    last.release_before = d.release_before.load(std::memory_order_relaxed);
++    last.expected = d.expected_seconds.load(std::memory_order_relaxed);
++    return last;
 +}
 +void fast_probe_enable(bool on) noexcept {
 +    auto& f = fast_probe();
@@ -431,7 +474,8 @@ diff -ruN a/Extension/Skater/no_bail.cpp b/Extension/Skater/no_bail.cpp
  void watch_physics_state(std::uintptr_t client, std::uintptr_t entity) noexcept {
      auto& w = state_watch();
      Owner owner;
-diff -ruN a/Extension/Skater/no_bail.h b/Extension/Skater/no_bail.h
+diff --git a/Extension/Skater/no_bail.h b/Extension/Skater/no_bail.h
+index 910da1f..1ac87f7 100644
 --- a/Extension/Skater/no_bail.h
 +++ b/Extension/Skater/no_bail.h
 @@ -1,4 +1,5 @@
@@ -440,7 +484,7 @@ diff -ruN a/Extension/Skater/no_bail.h b/Extension/Skater/no_bail.h
  #include <cstdint>
  
  namespace dingosdk {
-@@ -25,6 +26,31 @@
+@@ -25,6 +26,30 @@ struct PhysicsStateWatch {
  };
  void watch_physics_state(std::uintptr_t client, std::uintptr_t entity) noexcept;
  PhysicsStateWatch watched_physics_state() noexcept;
@@ -455,52 +499,161 @@ diff -ruN a/Extension/Skater/no_bail.h b/Extension/Skater/no_bail.h
 +};
 +void fast_probe_enable(bool on) noexcept;
 +std::size_t fast_probe_drain(FastProbeRow* rows, std::size_t capacity) noexcept;
-+// Dark Pop: while enabled, D-pad Right held (`held`) as the local skater's flight ends makes the selector choose
-+// the pop state (200) instead of the landing, once per second at most. The game's bail handling (No Bail's
-+// protection) is used only around that, so No Bail itself can stay off: while D-pad Right is held in the air,
-+// and from a forced pop until shortly after the next landing. Publish from the client tick.
-+void dark_pop_update(bool enabled, bool held) noexcept;
-+// True while Dark Pop wants No Bail's protection for the local skater. The client tick adds it to the lease.
-+bool dark_pop_protecting() noexcept;
++// Dark Pop (auto release): for each flight from the ground, the selector hook times the expected landing from the
++// last few flights and has the game shown D-pad Right released `lead` seconds before it (input_capture.cpp does the
++// showing). Publish from the client tick.
++void dark_pop_update(bool enabled, float lead) noexcept;
 +struct DarkPopLast {
-+    std::uint64_t count{}; // pops forced since the process started
-+    std::uint32_t from{}, to{}; // the air state it left and the state the game wanted
-+    std::uint64_t landings{}; // landings that followed a forced pop, since the process started
-+    std::uint32_t landed{}; // the state the last of them went to (100-199 is riding away)
++    std::uint64_t flights{}; // timed flights finished since the process started
++    bool pressed{};          // D-pad Right was pressed in the last one
++    std::uint32_t landed{};  // the state chosen at its landing: 200 = popped again, 100-199 = rode away
++    float seconds{};         // how long it was in the air
++    float release_before{};  // how long before the landing the game was shown the release (negative: not before it)
++    float expected{};        // the flight time the release was timed for
 +};
 +DarkPopLast dark_pop_last() noexcept;
  // Stopping flight must not discard the independent manual preference.
  void clear_no_bail_flight() noexcept;
  }
-diff -ruN a/Extension/UI/Overlay/overlay.h b/Extension/UI/Overlay/overlay.h
+diff --git a/Extension/UI/Overlay/input_capture.cpp b/Extension/UI/Overlay/input_capture.cpp
+index 82c2e10..7cb0b69 100644
+--- a/Extension/UI/Overlay/input_capture.cpp
++++ b/Extension/UI/Overlay/input_capture.cpp
+@@ -300,9 +300,50 @@ BOOL WINAPI captured_cursor_position(LPPOINT output) {
+     if (result && output && !overlay_input_access) { last = *output; sampled = true; }
+     return result;
+ }
++// ---- Dark Pop auto release ----------------------------------------------------------
++// Driven by the physics selector hook (Extension/Skater/no_bail.cpp) through the extern "C" functions at the end
++// of this file. During a timed flight it changes only what the game's own XInput polls see of D-pad Right: once
++// the player has pressed it in that flight, the game sees it held until the release time and then released until
++// the player really lets go. ReSkate's own readers (overlay_input_access) always get the real pad.
++struct DarkPopRelease {
++    std::atomic<bool> enabled{}, latched{}, released{}, hiding{};
++    std::atomic<std::int64_t> release_at{}; // QueryPerformanceCounter; 0 = no timed flight
++    std::atomic<std::int64_t> shown_release{}; // when the game was shown the release (QPC), 0 = not yet
++    std::atomic<unsigned> flags{}; // last change made: 1 = shown held, 2 = hidden (for the probe)
++    std::atomic<std::uint64_t> polls{}; // the game's own XInput polls while enabled
++};
++DarkPopRelease& dark_pop_release() { static auto* value = new DarkPopRelease; return *value; }
++std::int64_t dark_pop_clock() noexcept { LARGE_INTEGER now{}; QueryPerformanceCounter(&now); return now.QuadPart; }
++// The game's own poll: returns 1 if D-pad Right was added, 2 if it was taken away, 0 if the pad is unchanged.
++unsigned dark_pop_filter(WORD& buttons) noexcept {
++    auto& r = dark_pop_release();
++    if (!r.enabled.load(std::memory_order_relaxed)) return 0;
++    r.polls.fetch_add(1, std::memory_order_relaxed);
++    const bool physical = (buttons & XINPUT_GAMEPAD_DPAD_RIGHT) != 0;
++    const auto release_at = r.release_at.load(std::memory_order_acquire);
++    if (release_at && !r.released.load(std::memory_order_relaxed)) {
++        const auto now = dark_pop_clock();
++        if (now < release_at) {
++            if (physical) r.latched.store(true, std::memory_order_relaxed);
++            if (!r.latched.load(std::memory_order_relaxed)) return 0;
++            buttons = static_cast<WORD>(buttons | XINPUT_GAMEPAD_DPAD_RIGHT); // held for the game, even if the player already let go
++            return physical ? 0u : 1u;
++        }
++        if (r.latched.load(std::memory_order_relaxed)) {
++            r.released.store(true, std::memory_order_relaxed);
++            r.shown_release.store(now, std::memory_order_relaxed);
++            r.hiding.store(true, std::memory_order_relaxed);
++        }
++    }
++    if (!r.hiding.load(std::memory_order_relaxed)) return 0;
++    if (!physical) { r.hiding.store(false, std::memory_order_relaxed); return 0; } // the player let go too
++    buttons = static_cast<WORD>(buttons & ~XINPUT_GAMEPAD_DPAD_RIGHT);
++    return 2;
++}
+ template<std::size_t I, bool Extended = false>
+ DWORD WINAPI captured_xinput(DWORD user, XINPUT_STATE* output) {
+     const auto& hook = Extended ? input_hooks().xinput_extended[I] : input_hooks().xinput_state[I];
++    const bool game_poll = !overlay_input_access;
+     const bool capture = block_polled_input();
+     DWORD result;
+     { // XInput exports can forward through another hooked XInput export.
+@@ -314,6 +355,11 @@ DWORD WINAPI captured_xinput(DWORD user, XINPUT_STATE* output) {
+         // The game must notice a neutral state even if the physical packet did
+         // not change between opening the menu and its next controller poll.
+         output->dwPacketNumber ^= 0x80000000u;
++    } else if (result == ERROR_SUCCESS && output && game_poll) {
++        // A changed button needs a changed packet number, or the game may keep the state it already has.
++        const auto changed = dark_pop_filter(output->Gamepad.wButtons);
++        if (changed) output->dwPacketNumber ^= changed << 29;
++        dark_pop_release().flags.store(changed, std::memory_order_relaxed);
+     }
+     return result;
+ }
+@@ -580,3 +626,38 @@ bool install_input_capture() {
+ }
+ 
+ }
++
++// Dark Pop auto release, for the physics selector hook (Extension/Skater/no_bail.cpp) and the client tick.
++extern "C" void DingoSDKOverlayDarkPopEnable(bool enabled) noexcept {
++    auto& r = dingosdk::overlay::detail::dark_pop_release();
++    if (!r.enabled.exchange(enabled, std::memory_order_acq_rel) || enabled) return;
++    r.release_at.store(0, std::memory_order_release);
++    r.latched.store(false, std::memory_order_relaxed);
++    r.hiding.store(false, std::memory_order_relaxed);
++}
++// A timed flight starts: the game is shown D-pad Right released from `release_at` (QueryPerformanceCounter) on.
++extern "C" void DingoSDKOverlayDarkPopFlightStart(std::int64_t release_at) noexcept {
++    auto& r = dingosdk::overlay::detail::dark_pop_release();
++    r.latched.store(false, std::memory_order_relaxed);
++    r.released.store(false, std::memory_order_relaxed);
++    r.shown_release.store(0, std::memory_order_relaxed);
++    r.release_at.store(release_at, std::memory_order_release);
++}
++// The flight ended. Says whether the player pressed D-pad Right in it and when the game was shown the release (0 if the
++// landing came first; the game is then shown the release now).
++extern "C" bool DingoSDKOverlayDarkPopFlightEnd(std::int64_t* shown_release) noexcept {
++    auto& r = dingosdk::overlay::detail::dark_pop_release();
++    r.release_at.store(0, std::memory_order_release);
++    const bool latched = r.latched.exchange(false, std::memory_order_acq_rel);
++    if (latched && !r.released.exchange(true, std::memory_order_acq_rel)) r.hiding.store(true, std::memory_order_relaxed);
++    if (shown_release) *shown_release = r.shown_release.load(std::memory_order_relaxed);
++    return latched;
++}
++// 1 = the game's last poll was shown D-pad Right held by the mod, 2 = hidden by the mod, 0 = untouched.
++extern "C" unsigned DingoSDKOverlayDarkPopInputFlags() noexcept {
++    return dingosdk::overlay::detail::dark_pop_release().flags.load(std::memory_order_relaxed);
++}
++// The game's own XInput polls counted while the auto release was on (0 means the game does not read the pad through XInput).
++extern "C" std::uint64_t DingoSDKOverlayDarkPopGamePolls() noexcept {
++    return dingosdk::overlay::detail::dark_pop_release().polls.load(std::memory_order_relaxed);
++}
+diff --git a/Extension/UI/Overlay/overlay.h b/Extension/UI/Overlay/overlay.h
+index 3c3b5b8..46a28e6 100644
 --- a/Extension/UI/Overlay/overlay.h
 +++ b/Extension/UI/Overlay/overlay.h
-@@ -67,6 +67,9 @@
+@@ -67,6 +67,10 @@ enum class DebugAction {
      set_first_person_spring_right,
      reset_first_person_arm,
      set_free_camera_fov,  // 0 = the game's own FOV
 +    set_probe_enabled,
 +    set_dark_pop_enabled,
 +    set_dark_pop_strength,
++    set_dark_pop_release,
      // Keep the last action in sync with the bound in request_scheduler.h.
  };
  
-@@ -114,6 +117,11 @@
+@@ -114,6 +118,12 @@ struct DebugModel {
      float camera_speed = 15.0f;
      float forward_velocity_speed = 20.0f;
      float up_velocity_speed = 20.0f;
-+    // Dark Pop: D-pad Right held as a flight ends makes the game pop again (see no_bail.cpp).
++    // Dark Pop: the mod times the release of D-pad Right for the game (see no_bail.cpp, input_capture.cpp).
 +    bool dark_pop = false;
 +    float dark_pop_strength = 0.0f; // extra upward m/s after the pop
++    float dark_pop_release = 0.16f; // seconds before landing
 +    std::uint64_t dark_pop_count = 0;
 +    bool probe = false; // Dark pop probe: writes logs\dark-pop-probe.csv
      bool camera_position_valid = false;
      bool skater_position_valid = false;
      std::array<float, 3> camera_position{};
-diff -ruN a/Extension/UI/Overlay/overlay_notices.cpp b/Extension/UI/Overlay/overlay_notices.cpp
+diff --git a/Extension/UI/Overlay/overlay_notices.cpp b/Extension/UI/Overlay/overlay_notices.cpp
+index c2c3b48..1d06744 100644
 --- a/Extension/UI/Overlay/overlay_notices.cpp
 +++ b/Extension/UI/Overlay/overlay_notices.cpp
-@@ -37,7 +37,11 @@
+@@ -37,7 +37,11 @@ void draw_notices() {
          dingosdk::overlay::notify(NoticeLevel::info,
              dingosdk::reskate_release_build ? "ReSkate " + std::string(dingosdk::reskate_version) + " loaded"
                                              : std::string("ReSkate loaded (development build)"),
@@ -513,19 +666,24 @@ diff -ruN a/Extension/UI/Overlay/overlay_notices.cpp b/Extension/UI/Overlay/over
      }
      std::lock_guard lock(notices_mutex);
      if (notices.empty()) return;
-diff -ruN a/Extension/UI/Overlay/skate_menu_skater.cpp b/Extension/UI/Overlay/skate_menu_skater.cpp
+diff --git a/Extension/UI/Overlay/skate_menu_skater.cpp b/Extension/UI/Overlay/skate_menu_skater.cpp
+index 6c6e7d1..3ea82e2 100644
 --- a/Extension/UI/Overlay/skate_menu_skater.cpp
 +++ b/Extension/UI/Overlay/skate_menu_skater.cpp
-@@ -127,6 +127,18 @@
+@@ -127,6 +127,22 @@ void movement_controls(SkateMenu& menu, const Model& model, const CallbacksV3& c
      if (ImGui::SliderFloat("##up-velocity", &up_velocity, 1.0f, 25.0f, "+%.1f", ImGuiSliderFlags_AlwaysClamp))
          debug_request(menu, callbacks, {DebugAction::set_up_velocity_speed, false, up_velocity});
      ImGui::EndDisabled();
++    field(menu, "Dark Pop release");
++    float dark_release = debug.dark_pop_release;
++    if (ImGui::SliderFloat("##dark-pop-release", &dark_release, 0.05f, 0.30f, "%.2f s before landing", ImGuiSliderFlags_AlwaysClamp))
++        debug_request(menu, callbacks, {DebugAction::set_dark_pop_release, false, dark_release});
 +    field(menu, "Dark Pop extra pop");
 +    float dark_strength = debug.dark_pop_strength;
 +    if (ImGui::SliderFloat("##dark-pop-strength", &dark_strength, 0.0f, 25.0f, "+%.1f m/s", ImGuiSliderFlags_AlwaysClamp))
 +        debug_request(menu, callbacks, {DebugAction::set_dark_pop_strength, false, dark_strength});
 +    bool dark_pop = debug.dark_pop;
-+    if (toggle_row(menu, "Dark Pop", "Hold D-pad Right as a flip trick lands to pop again off the ground. No Bail can stay off: Dark Pop only holds off bails around the pop.",
++    if (toggle_row(menu, "Dark Pop", "Press D-pad Right in the air on a dark catch, then hold it or let go: the game sees it held and let go at the time set above, timed from your last few flights. Best on flat ground.",
 +            dark_pop, callbacks.queue_debug != nullptr))
 +        debug_request(menu, callbacks, {DebugAction::set_dark_pop_enabled, dark_pop});
 +    bool probe = debug.probe;
@@ -535,7 +693,8 @@ diff -ruN a/Extension/UI/Overlay/skate_menu_skater.cpp b/Extension/UI/Overlay/sk
      note("Controller: left stick moves, right stick looks, RT / LT rise and fall, click the left stick to boost.");
      note("Keyboard: WASD / Q E, Shift to boost. Close the menu to fly.");
      end_card();
-diff -ruN a/Launcher/crash_reporter.cpp b/Launcher/crash_reporter.cpp
+diff --git a/Launcher/crash_reporter.cpp b/Launcher/crash_reporter.cpp
+index ce18077..9f9f6ce 100644
 --- a/Launcher/crash_reporter.cpp
 +++ b/Launcher/crash_reporter.cpp
 @@ -7,6 +7,7 @@
@@ -546,7 +705,7 @@ diff -ruN a/Launcher/crash_reporter.cpp b/Launcher/crash_reporter.cpp
  #include <cstdlib>
  #include <fstream>
  #include <format>
-@@ -29,6 +30,12 @@
+@@ -29,6 +30,12 @@ bool publish_dump(const std::filesystem::path& temporary, const SharedReport& re
      attributes["application"] = "ReSkate";
      attributes["process"] = utf8(report.application.data());
      attributes["version"] = build_version;
@@ -559,22 +718,24 @@ diff -ruN a/Launcher/crash_reporter.cpp b/Launcher/crash_reporter.cpp
  #ifdef _DEBUG
      attributes["build.configuration"] = "Debug";
  #else
-diff -ruN a/Runtime/request_scheduler.h b/Runtime/request_scheduler.h
+diff --git a/Runtime/request_scheduler.h b/Runtime/request_scheduler.h
+index c116173..2091baa 100644
 --- a/Runtime/request_scheduler.h
 +++ b/Runtime/request_scheduler.h
-@@ -74,7 +74,7 @@
+@@ -74,7 +74,7 @@ public:
          const bool restore = request.action == overlay::DebugAction::restore_debug;
          if (!context.tick_ready || (!context.healthy && !restore) || loading() ||
              request.action < overlay::DebugAction::set_free_camera ||
 -            request.action > overlay::DebugAction::set_free_camera_fov || !std::isfinite(request.value) ||
-+            request.action > overlay::DebugAction::set_dark_pop_strength || !std::isfinite(request.value) ||
++            request.action > overlay::DebugAction::set_dark_pop_release || !std::isfinite(request.value) ||
              (!restore && count<overlay::DebugRequest>() >= 16)) return false;
          if (restore) clear<overlay::DebugRequest>();
          append(request, thread); return true;
-diff -ruN a/cmake/ProjectOptions.cmake b/cmake/ProjectOptions.cmake
+diff --git a/cmake/ProjectOptions.cmake b/cmake/ProjectOptions.cmake
+index bb2523c..c913f2b 100644
 --- a/cmake/ProjectOptions.cmake
 +++ b/cmake/ProjectOptions.cmake
-@@ -10,6 +10,15 @@
+@@ -10,6 +10,15 @@ set_property(GLOBAL PROPERTY USE_FOLDERS ON)
  # Windows version information (Explorer's Details tab) for the shipped binaries. The release
  # script passes its version; local builds say 0.0.0.
  set(DINGOSDK_VERSION "0.0.0" CACHE STRING "Release version stamped into the shipped binaries")
@@ -590,10 +751,11 @@ diff -ruN a/cmake/ProjectOptions.cmake b/cmake/ProjectOptions.cmake
  # The same version for code to show (generated/reskate_version.h).
  string(REPLACE "\\" "\\\\" reskate_version_escaped "${DINGOSDK_VERSION}")
  string(REPLACE "\"" "\\\"" reskate_version_escaped "${reskate_version_escaped}")
-diff -ruN a/cmake/templates/reskate_version.h.in b/cmake/templates/reskate_version.h.in
+diff --git a/cmake/templates/reskate_version.h.in b/cmake/templates/reskate_version.h.in
+index 761d25e..333cf82 100644
 --- a/cmake/templates/reskate_version.h.in
 +++ b/cmake/templates/reskate_version.h.in
-@@ -5,4 +5,9 @@
+@@ -5,4 +5,9 @@ namespace dingosdk {
  // The release version (DINGOSDK_VERSION); local builds say 0.0.0.
  inline constexpr std::string_view reskate_version = "@reskate_version_escaped@";
  inline constexpr bool reskate_release_build = reskate_version != "0.0.0";
