@@ -1,0 +1,43 @@
+name: Watch ReSkate releases
+
+# Opens an issue when the ReSkate project publishes a release this repo has not been rebuilt for,
+# so the mod is updated instead of silently going stale. It changes no code.
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Compare with the last version this mod was built for
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          latest=$(gh api repos/Dingo-Shenanigans/ReSkate/releases/latest --jq '.tag_name' || true)
+          built=$(cat thunderstore/UPSTREAM_VERSION 2>/dev/null | tr -d '[:space:]' || true)
+          latest=${latest#v}; built=${built#v}
+          echo "ReSkate latest release: ${latest:-unknown}; mod built for: ${built:-unknown}"
+          if [ -z "$latest" ] || [ "$latest" = "$built" ]; then exit 0; fi
+          title="ReSkate $latest is out: rebuild this mod"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq 'length')
+          if [ "$existing" = "0" ]; then
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "The ReSkate project published **$latest**; this mod was built for **${built:-an unknown version}**.
+
+          1. Run **Actions > Build Dark Pop** with upstream_ref set to the new tag (for example v$latest) and a new mod_version.
+          2. If the **Apply the patch** step fails, ReSkate changed a file the patch edits: the patch needs updating for that version.
+          3. Test the zip from the run, then put the new version in \`thunderstore/UPSTREAM_VERSION\`.
+          4. To publish, run it again with **publish** ticked, and upload the zip to thunderstore.io."
+          fi
