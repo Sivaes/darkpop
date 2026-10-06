@@ -15,7 +15,7 @@ on:
       mod_version:
         description: Dark Pop version, x.y.z
         required: true
-        default: 0.3.3
+        default: 0.4.0
       publish:
         description: Publish a self-updating GitHub release (leave off for a zip to test or send to a friend)
         type: boolean
