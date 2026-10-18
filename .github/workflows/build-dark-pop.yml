@@ -1892,6 +1892,8 @@ jobs:
           path: |
             out/release/ReSkate_DarkPop-${{ inputs.mod_version }}.zip
             out/release/ReSkate_DarkPop-${{ inputs.mod_version }}-mods-folder.zip
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Upload the symbols (for reading a crash)
         uses: actions/upload-artifact@v7
@@ -1901,5 +1903,4 @@ jobs:
             out/release/ReSkate.pdb
             out/release/ReSkateLauncher.pdb
           if-no-files-found: ignore
-          if-no-files-found: error
           retention-days: 30
