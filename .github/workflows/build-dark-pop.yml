@@ -1818,6 +1818,21 @@ jobs:
             "Applied patches/$name" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           }
 
+      - name: Fetch the Spotify helper's crates
+        # ReSkate 2.1.0 links a Rust library (SpotifyHelper, the game as a Spotify Connect device) when cargo is on the
+        # machine, and its cmake looks for a Windows import library in cargo's cache, which is only there once the
+        # crates are fetched. Without the fetch the configure fails ("list GET given empty list"). If cargo cannot
+        # fetch, the build goes on without the Spotify device, as on a machine without cargo.
+        working-directory: src/SpotifyHelper
+        run: |
+          $skip = '0'
+          if (Get-Command cargo -ErrorAction SilentlyContinue) {
+            cargo fetch
+            if ($LASTEXITCODE -ne 0) { $skip = '1'; Write-Host 'cargo fetch failed: building without the Spotify device.' }
+          } else { $skip = '1'; Write-Host 'No cargo: building without the Spotify device.' }
+          "SKIP_SPOTIFY=$skip" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          if ($skip -eq '1') { "Built without the Spotify device (cargo missing or its fetch failed)" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY }
+
       - name: Configure
         # A test zip never replaces itself.
         # Crash reports stay on and go where ReSkate's go, labelled with this mod's name and version.
@@ -1829,6 +1844,7 @@ jobs:
           "Mod repository commit: $commit" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           $cmakeArgs = @('--preset', 'vs2022-x64', "-DDINGOSDK_VERSION=$env:BASE_VERSION", "-DDINGOSDK_MOD_ID=$env:MOD_NAME", "-DDINGOSDK_MOD_VERSION=$env:MOD_VERSION+$commit")
           $cmakeArgs += '-DDINGOSDK_LAUNCHER_AUTO_UPDATE=OFF'
+          if ($env:SKIP_SPOTIFY -eq '1') { $cmakeArgs += '-DDINGOSDK_CARGO=DINGOSDK_CARGO-NOTFOUND' }
           cmake @cmakeArgs
 
       - name: Build launcher and runtime
