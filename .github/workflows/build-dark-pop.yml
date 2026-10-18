@@ -25,6 +25,10 @@ on:
         description: Trainer version for this build, x.y.z
         required: true
         default: 0.6.3
+      full_package:
+        description: Also build the full Mods-folder package (Install.bat, manifest, changelog, icon) for the launcher's MODS tab
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -2015,32 +2019,55 @@ jobs:
         run: cmake --build --preset release --parallel 4 --target dingosdk_launcher dingosdk_runtime
 
       - name: Package
+        # The zip is lean: the two files that go beside Skate.exe, the license and a short note. Drop them over the
+        # ReSkate ones (close the game and the launcher first). With full_package on, a second zip carries the old
+        # Mods-folder layout for installing from the launcher's MODS tab.
         run: |
           $ErrorActionPreference = 'Stop'
           $ws = $env:GITHUB_WORKSPACE
-          $release = "$ws/out/release"; $package = "$ws/out/package/ReSkate_Trainer"
-          New-Item -ItemType Directory -Path $release, "$package/licenses" -Force | Out-Null
+          $release = "$ws/out/release"; $lean = "$ws/out/lean"; $package = "$ws/out/package/ReSkate_Trainer"
+          New-Item -ItemType Directory -Path $release, $lean -Force | Out-Null
           Copy-Item "$ws/src/build/vs2022-x64/Release/ReSkate.dll", "$ws/src/build/vs2022-x64/Release/ReSkateLauncher.exe" -Destination $release
           Copy-Item "$ws/src/build/vs2022-x64/Release/ReSkate.pdb", "$ws/src/build/vs2022-x64/Release/ReSkateLauncher.pdb" -Destination $release -ErrorAction SilentlyContinue
-          Copy-Item -Path "$ws/mod/package/*" -Destination $package -Recurse
-          Copy-Item "$release/ReSkate.dll", "$release/ReSkateLauncher.exe" -Destination $package
-          Copy-Item "$ws/src/LICENSE" -Destination "$package/LICENSE"
-          foreach ($dir in Get-ChildItem "$ws/src/External" -Directory) {
-            $file = Get-ChildItem $dir.FullName -File | Where-Object { $_.Name -match '^LICENSE(\.txt)?$' } | Select-Object -First 1
-            if ($file) { Copy-Item $file.FullName "$package/licenses/$($dir.Name)-LICENSE.txt" }
-          }
-          Copy-Item "$ws/src/External/fonts/*-LICENSE.txt" "$package/licenses" -ErrorAction SilentlyContinue
-          $manifestPath = "$package/manifest.json"
-          $manifest = Get-Content -Raw $manifestPath | ConvertFrom-Json
-          $manifest.version_number = $env:MOD_VERSION
-          $manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8NoBOM $manifestPath
-          foreach ($file in 'Install.bat', 'INSTALL.txt') {
-            $path = "$package/$file"
-            (Get-Content -Raw $path).Replace('@MOD@', $env:MOD_VERSION) | Set-Content -NoNewline -Encoding utf8NoBOM $path
-          }
+          # The lean zip.
+          Copy-Item "$release/ReSkate.dll", "$release/ReSkateLauncher.exe" -Destination $lean
+          Copy-Item "$ws/src/LICENSE" -Destination "$lean/LICENSE.txt"
+          @(
+            "ReSkate Trainer $env:MOD_VERSION with Dark Pop 3.2 (built on ReSkate $env:BASE_VERSION)"
+            ""
+            "Close the game and the ReSkate launcher, then copy ReSkate.dll and ReSkateLauncher.exe"
+            "over the ones in your Skate folder (next to Skate.exe). Keep copies of the originals."
+            "Start ReSkateLauncher.exe as usual. In game: Insert > PHYSICS > TUNE > TRICKLINING > DARK POP."
+            ""
+            "Source (GPL-3.0): https://github.com/andrewnakas/reskate-trainer and https://github.com/Sivaes/darkpop"
+          ) -join "`r`n" | Set-Content -NoNewline -Encoding utf8NoBOM "$lean/README.txt"
           $zip = "$release/ReSkate_Trainer-$env:MOD_VERSION.zip"
-          Compress-Archive -Path "$ws/out/package/ReSkate_Trainer" -DestinationPath $zip -Force
-          $lines = foreach ($f in "$release/ReSkate.dll", "$release/ReSkateLauncher.exe", $zip) { "$((Get-FileHash $f -Algorithm SHA256).Hash.ToLower())  $(Split-Path $f -Leaf)" }
+          Compress-Archive -Path "$lean/*" -DestinationPath $zip -Force
+          $hashed = @("$release/ReSkate.dll", "$release/ReSkateLauncher.exe", $zip)
+          # The full Mods-folder package, only when asked for.
+          if ('${{ inputs.full_package }}' -eq 'true') {
+            New-Item -ItemType Directory -Path "$package/licenses" -Force | Out-Null
+            Copy-Item -Path "$ws/mod/package/*" -Destination $package -Recurse
+            Copy-Item "$release/ReSkate.dll", "$release/ReSkateLauncher.exe" -Destination $package
+            Copy-Item "$ws/src/LICENSE" -Destination "$package/LICENSE"
+            foreach ($dir in Get-ChildItem "$ws/src/External" -Directory) {
+              $file = Get-ChildItem $dir.FullName -File | Where-Object { $_.Name -match '^LICENSE(\.txt)?$' } | Select-Object -First 1
+              if ($file) { Copy-Item $file.FullName "$package/licenses/$($dir.Name)-LICENSE.txt" }
+            }
+            Copy-Item "$ws/src/External/fonts/*-LICENSE.txt" "$package/licenses" -ErrorAction SilentlyContinue
+            $manifestPath = "$package/manifest.json"
+            $manifest = Get-Content -Raw $manifestPath | ConvertFrom-Json
+            $manifest.version_number = $env:MOD_VERSION
+            $manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8NoBOM $manifestPath
+            foreach ($file in 'Install.bat', 'INSTALL.txt') {
+              $path = "$package/$file"
+              (Get-Content -Raw $path).Replace('@MOD@', $env:MOD_VERSION) | Set-Content -NoNewline -Encoding utf8NoBOM $path
+            }
+            $full = "$release/ReSkate_Trainer-$env:MOD_VERSION-mods-folder.zip"
+            Compress-Archive -Path "$ws/out/package/ReSkate_Trainer" -DestinationPath $full -Force
+            $hashed += $full
+          }
+          $lines = foreach ($f in $hashed) { "$((Get-FileHash $f -Algorithm SHA256).Hash.ToLower())  $(Split-Path $f -Leaf)" }
           $lines | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           $lines
 
@@ -2048,7 +2075,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ${{ env.MOD_NAME }}-${{ inputs.mod_version }}-darkpop3-on-${{ inputs.trainer_ref }}
-          path: out/release/ReSkate_Trainer-${{ inputs.mod_version }}.zip
+          path: |
+            out/release/ReSkate_Trainer-${{ inputs.mod_version }}.zip
+            out/release/ReSkate_Trainer-${{ inputs.mod_version }}-mods-folder.zip
 
       - name: Upload the symbols (for reading a crash)
         uses: actions/upload-artifact@v7
