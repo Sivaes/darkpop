@@ -25,7 +25,7 @@ index aa0826f..e87f0a6 100644
  // Runtime adapters. Invoked only by the verified game-thread dispatcher.
 diff --git a/Extension/Skater/dark_flip.cpp b/Extension/Skater/dark_flip.cpp
 new file mode 100644
-index 0000000..d0132f9
+index 0000000..7be3d91
 --- /dev/null
 +++ b/Extension/Skater/dark_flip.cpp
 @@ -0,0 +1,1584 @@
@@ -291,12 +291,12 @@ index 0000000..d0132f9
 +        if (front && back && (at == front || at == back)) {
 +            (at == front ? g.raw_front : g.raw_back).store(value ? 1 : 0, std::memory_order_relaxed);
 +            const std::uint8_t any = g.raw_front.load(std::memory_order_relaxed) | g.raw_back.load(std::memory_order_relaxed);
-+            const std::uint8_t f = want > 0 ? any : 0, b = want < 0 ? any : 0;
++            const std::uint8_t set_front = want > 0 ? any : 0, set_back = want < 0 ? any : 0;
 +            auto* const pf = reinterpret_cast<volatile std::uint8_t*>(front);
 +            auto* const pb = reinterpret_cast<volatile std::uint8_t*>(back);
-+            if (*pf != f || *pb != b) g.dir_fixed.fetch_add(1, std::memory_order_relaxed);
-+            *pf = f;
-+            *pb = b;
++            if (*pf != set_front || *pb != set_back) g.dir_fixed.fetch_add(1, std::memory_order_relaxed);
++            *pf = set_front;
++            *pb = set_back;
 +        }
 +    }
 +    return written;
